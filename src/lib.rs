@@ -10,6 +10,7 @@ pub mod util {
 
 use cgmath::Deg;
 use std::default::Default;
+use std::num::NonZeroU32;
 use wgpu::{BufferBindingType, DynamicOffset};
 use winit::{
     event::*,
@@ -22,7 +23,7 @@ use winit::window::CursorGrabMode;
 
 use crate::util::camera::*;
 use crate::util::constructors::*;
-use crate::util::shapes::{Shape, ShapeData};
+use crate::util::shapes::ShapeManager;
 use crate::util::vertex;
 use crate::util::vertex::VERTICES;
 
@@ -40,9 +41,10 @@ struct State {
     num_vertices: u32,
 
     // Shape Config
-    shapes: Vec<Box<dyn Shape>>,
-    shape_buffer: wgpu::Buffer,
+    shape_manager: ShapeManager,
     shape_bind_group: wgpu::BindGroup,
+    shape_buffer: wgpu::Buffer,
+    sphere_buffer: wgpu::Buffer,
 
     // Camera Config
     camera: Camera,
@@ -52,12 +54,27 @@ struct State {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
 
-    // Mouse config
+    // Misc config
     mouse_pressed: bool,
+    shader_params: ShaderParams,
+    config_buffer: wgpu::Buffer,
+    config_bind_group: wgpu::BindGroup,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShaderParams {
+    time: f32,
+    width: u32,
+    height: u32,
+
+    // Array sizes
+    shape_count: u32,
+    sphere_count: u32,
 }
 
 impl State {
-    async fn new(window: &Window) -> Self {
+    async fn new(window: &Window) -> State {
         //#region Device & Window Config
         let size = window.inner_size();
 
@@ -85,8 +102,7 @@ impl State {
 
         //#region Camera Config
         let camera = Camera::new((0.0, 0.0, 10.0), Deg::<f32>(0.0), Deg::<f32>(0.0));
-        let projection =
-            Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
+        let projection = Projection::new(config.width, config.height, Deg(45.0), 0.1, 100.0);
         let camera_controller = CameraController::new(4.0, 0.25);
 
         let mut camera_uniform = CameraUniform::new();
@@ -116,33 +132,115 @@ impl State {
         );
         //#endregion
 
+        //#region config buffer
+        let shader_params = ShaderParams {
+            time: 0.0,
+            width: size.width,
+            height: size.height,
+            shape_count: 0,
+            sphere_count: 0,
+        };
+
+        let config_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Buffer"),
+            contents: bytemuck::cast_slice(&[shader_params]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let config_bind_group_layout = create_bind_group_layout(
+            &device,
+            1,
+            BufferBindingType::Uniform,
+            false,
+            None,
+            "config_bind_group_layout",
+        );
+
+        let config_bind_group = create_bind_group(
+            &device,
+            &config_bind_group_layout,
+            1,
+            config_buffer.as_entire_binding(),
+            "config_bind_group",
+        );
+        //#endregion
+
+        //#region shape buffers
+        let mut shape_manager = ShapeManager::new();
+        for x in 0..17 {
+            for y in 0..23 {
+                shape_manager.new_sphere(
+                    ((x * 3) as f32, (y * 3) as f32, 0.0).into(),
+                    1.0,
+                    (0.2 + (x as f32 * 0.04), 0.2 + (y as f32 * 0.04), 0.2).into(),
+                );
+            }
+        }
+
         let shape_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Shape Buffer"),
-            contents: bytemuck::cast_slice(&[ShapeData::default()]),
+            contents: &*shape_manager.serialize_shapes(),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        let shape_bind_group_layout = create_bind_group_layout(
-            &device,
-            1,
-            BufferBindingType::Storage { read_only: false },
-            true,
-            None,
-            "shape_bind_group_layout",
-        );
+        let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Sphere Buffer"),
+            contents: &*shape_manager.serialize_spheres(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
 
-        let shape_bind_group = create_bind_group(
-            &device,
-            &shape_bind_group_layout,
-            1,
-            shape_buffer.as_entire_binding(),
-            "shape_bind_group",
-        );
+        let shape_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: true,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: true,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+                label: Some("shape_bind_group_layout"),
+            });
 
+        let shape_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &shape_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: shape_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sphere_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("shape_bind_group"),
+        });
+        //#endregion
+
+        //#region render pipeline
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &shape_bind_group_layout],
+                bind_group_layouts: &[
+                    &camera_bind_group_layout, // group 0
+                    &config_bind_group_layout, // group 1
+                    &shape_bind_group_layout,  // group 2
+                ],
                 push_constant_ranges: &[],
             });
 
@@ -180,6 +278,7 @@ impl State {
             },
             multiview: None,
         });
+        //#endregion
 
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
@@ -203,9 +302,10 @@ impl State {
             num_vertices,
 
             // Shape Config
-            shapes: vec![],
-            shape_buffer,
+            shape_manager,
             shape_bind_group,
+            shape_buffer,
+            sphere_buffer,
 
             // Camera config
             camera,
@@ -214,7 +314,12 @@ impl State {
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+
+            // Misc
             mouse_pressed: false,
+            shader_params,
+            config_buffer,
+            config_bind_group,
         }
     }
 
@@ -223,6 +328,8 @@ impl State {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
+            self.shader_params.width = new_size.width;
+            self.shader_params.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.projection.resize(new_size.width, new_size.height);
         }
@@ -259,10 +366,28 @@ impl State {
         self.camera_controller.update_camera(&mut self.camera, dt);
         self.camera_uniform
             .update_view_proj(&self.camera, &self.projection);
+        self.shader_params.time += dt.as_secs_f32();
+        self.shape_manager
+            .update_shader_config(&mut self.shader_params);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[self.camera_uniform]),
+        );
+        self.queue.write_buffer(
+            &self.config_buffer,
+            0,
+            bytemuck::cast_slice(&[self.shader_params]),
+        );
+        self.queue.write_buffer(
+            &self.shape_buffer,
+            0,
+            &*self.shape_manager.serialize_shapes(),
+        );
+        self.queue.write_buffer(
+            &self.sphere_buffer,
+            0,
+            &*self.shape_manager.serialize_spheres(),
         );
     }
 
@@ -300,19 +425,12 @@ impl State {
 
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            let shape_buffer_size: u32 =
-                (std::mem::size_of::<ShapeData>() * self.shapes.len().max(1)) as u32;
-
-            let chunks = (shape_buffer_size as f64
-                / self.device.limits().min_uniform_buffer_offset_alignment as f64)
-                .floor() as u32;
+            render_pass.set_bind_group(1, &self.config_bind_group, &[]);
 
             render_pass.set_bind_group(
-                1,
+                2,
                 &self.shape_bind_group,
-                &[DynamicOffset::from(
-                    chunks * self.device.limits().min_uniform_buffer_offset_alignment,
-                )],
+                &[DynamicOffset::default(), DynamicOffset::default()],
             );
 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -373,10 +491,10 @@ pub async fn run() {
                 event: DeviceEvent::MouseMotion{ delta, },
                 .. // We're not using device_id currently
             } =>
-            //     if state.mouse_pressed {
-            //     state.camera_controller.process_mouse(delta.0, delta.1)
-            // }
-            state.camera_controller.process_mouse(delta.0, delta.1),
+                if state.mouse_pressed {
+                state.camera_controller.process_mouse(delta.0, delta.1)
+            }
+            // state.camera_controller.process_mouse(delta.0, delta.1),
 
             Event::RedrawRequested(window_id) if window_id == window.id() => {
                 let now = instant::Instant::now();
