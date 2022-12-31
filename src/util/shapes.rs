@@ -1,12 +1,15 @@
 use bytemuck::Contiguous;
-use cgmath::{Quaternion, Vector3};
+use cgmath::{Quaternion, Rotation3, Vector3};
 use std::any::Any;
 use wgpu::Device;
 
 use super::super::ShaderParams;
 
+//#region Shape
 pub trait Shape {
     fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     fn shape_data(&self) -> ShapeData;
 
@@ -40,8 +43,7 @@ impl Default for ShapeData {
         }
     }
 }
-
-static mut SPHERE_INDEX: u32 = 0;
+//#endregion
 
 pub struct Sphere {
     pos: Vector3<f32>,
@@ -50,6 +52,7 @@ pub struct Sphere {
     index: u32,
 }
 
+//#region Sphere
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct SphereData {
@@ -64,8 +67,23 @@ impl Sphere {
     }
 }
 
+impl Default for Sphere {
+    fn default() -> Self {
+        Self {
+            pos: Vector3::new(0.0, 0.0, 0.0),
+            radius: 1.0,
+            color: Vector3::new(1.0, 1.0, 1.0),
+            index: u32::MAX_VALUE,
+        }
+    }
+}
+
 impl Shape for Sphere {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 
@@ -98,32 +116,121 @@ impl Shape for Sphere {
         self.index
     }
 }
+//#endregion
 
+//#region Cube
+pub struct Cube {
+    pos: Vector3<f32>,
+    _p1: f32, // padding (vec3 is 16 bytes on GPU)
+    bounds: Vector3<f32>,
+    _p2: f32, // padding (vec3 is 16 bytes on GPU)
+    rot: Quaternion<f32>,
+    color: Vector3<f32>,
+    index: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CubeData {
+    model: [f32; 3], // vec3 pos
+    _p1: f32,        // padding (vec3 is 16 bytes on GPU)
+    size: [f32; 3],  // vec3 bounds
+    _p2: f32,        // padding (vec3 is 16 bytes on GPU)
+    rot: [f32; 4],   // vec4 rot
+}
+
+impl Cube {
+    fn cube_data(&self) -> CubeData {
+        CubeData {
+            model: [self.pos.x, self.pos.y, self.pos.z],
+            _p1: 0.0,
+            size: [self.bounds.x, self.bounds.y, self.bounds.z],
+            _p2: 0.0,
+            rot: [self.rot.v.x, self.rot.v.y, self.rot.v.z, self.rot.s],
+        }
+    }
+
+    pub fn set_bounds(&mut self, bounds: Vector3<f32>) {
+        self.bounds = bounds;
+    }
+}
+
+impl Default for Cube {
+    fn default() -> Self {
+        Self {
+            pos: Vector3::new(0.0, 0.0, 0.0),
+            _p1: 0.0,
+            bounds: Vector3::new(1.0, 1.0, 1.0),
+            _p2: 0.0,
+            rot: Quaternion::new(1.0, 0.0, 0.0, 0.0),
+            color: Vector3::new(0.0, 0.0, 0.0),
+            index: u32::MAX_VALUE,
+        }
+    }
+}
+
+impl Shape for Cube {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn shape_data(&self) -> ShapeData {
+        ShapeData {
+            color: [self.color.x, self.color.y, self.color.z, 0.0],
+            index: self.index,
+            shape_type: 1,
+            _padding: [0.0, 0.0],
+        }
+    }
+
+    fn translate(&mut self, translation: Vector3<f32>) {
+        self.pos += translation;
+    }
+
+    fn set_pos(&mut self, pos: Vector3<f32>) {
+        self.pos = pos;
+    }
+
+    fn rotate(&mut self, rotation: Quaternion<f32>) {
+        // self.rot = rotation * self.rot;
+        self.rot = self.rot * rotation;
+    }
+
+    fn set_rotation(&mut self, rotation: Quaternion<f32>) {
+        self.rot = rotation;
+    }
+
+    fn get_index(&self) -> u32 {
+        self.index
+    }
+}
+//#endregion
+
+//#region ShapeManager
 pub struct ShapeManager {
     // Shæps
     shapes: Vec<Box<dyn Shape>>,
-    sphere_index: u32,
-
-    // Buffers
-    pub(crate) shape_buffer: Option<wgpu::Buffer>,
-    pub(crate) shape_bind_group: Option<wgpu::BindGroup>,
-    pub(crate) sphere_buffer: Option<wgpu::Buffer>,
-    pub(crate) sphere_bind_group: Option<wgpu::BindGroup>,
+    indices: [u32; 1000],
+    map: Vec<Vec<u32>>, // map of indices to shapes
 }
 
 impl ShapeManager {
     pub fn new() -> Self {
         Self {
             shapes: vec![],
-            sphere_index: 0,
-            shape_buffer: None,
-            shape_bind_group: None,
-            sphere_buffer: None,
-            sphere_bind_group: None,
+            indices: [0; 1000],
+            map: vec![vec![], vec![]],
         }
     }
 
     pub fn serialize_shapes(&self) -> Vec<u8> {
+        if self.shapes.len() == 0 {
+            return bytemuck::cast_slice(&[ShapeData::default()]).to_vec();
+        }
         self.shapes
             .iter()
             .flat_map(|a| -> Vec<u8> { bytemuck::cast_slice(&[a.shape_data()]).to_vec() })
@@ -131,6 +238,10 @@ impl ShapeManager {
     }
 
     pub fn serialize_spheres(&self) -> Vec<u8> {
+        if self.map[0].is_empty() {
+            return bytemuck::cast_slice(&[Sphere::default().sphere_data()])
+                .to_vec();
+        }
         self.shapes
             .iter()
             .filter_map(|a| -> Option<&Sphere> { a.as_any().downcast_ref::<Sphere>() })
@@ -138,19 +249,60 @@ impl ShapeManager {
             .collect()
     }
 
-    pub fn new_sphere(&mut self, pos: Vector3<f32>, radius: f32, color: Vector3<f32>) -> &Sphere {
+    pub fn serialize_cubes(&self) -> Vec<u8> {
+        if self.map[1].is_empty() {
+            return bytemuck::cast_slice(&[Cube::default().cube_data()])
+                .to_vec();
+        }
+        self.shapes
+            .iter()
+            .filter_map(|a| -> Option<&Cube> { a.as_any().downcast_ref::<Cube>() })
+            .flat_map(|a| -> Vec<u8> { bytemuck::cast_slice(&[a.cube_data()]).to_vec() })
+            .collect()
+    }
+
+    pub fn iter_shapes(&self) -> impl Iterator<Item = &Box<dyn Shape>> {
+        self.shapes.iter()
+    }
+
+    pub fn iter_shapes_mut(&mut self) -> impl Iterator<Item = &mut Box<dyn Shape>> {
+        self.shapes.iter_mut()
+    }
+
+    pub fn new_sphere(&mut self, pos: Vector3<f32>, radius: f32, color: Vector3<f32>) -> &mut Sphere {
+        self.map[0].push(self.shapes.len() as u32);
         self.shapes.push(Box::new(Sphere {
             pos,
             radius,
             color,
-            index: self.sphere_index,
+            index: self.indices[0],
         }));
-        self.sphere_index += 1;
+        self.indices[0] += 1;
         self.shapes
-            .last()
+            .last_mut()
             .unwrap()
-            .as_any()
-            .downcast_ref::<Sphere>()
+            .as_any_mut()
+            .downcast_mut::<Sphere>()
+            .unwrap()
+    }
+
+    pub fn new_cube(&mut self, pos: Vector3<f32>, bounds: Vector3<f32>, color: Vector3<f32>) -> &mut Cube {
+        self.map[1].push(self.shapes.len() as u32);
+        self.shapes.push(Box::new(Cube {
+            pos,
+            _p1: 0.0,
+            bounds,
+            _p2: 0.0,
+            rot: Quaternion::from_angle_z(cgmath::Rad(0.0)),
+            color,
+            index: self.indices[1],
+        }));
+        self.indices[1] += 1;
+        self.shapes
+            .last_mut()
+            .unwrap()
+            .as_any_mut()
+            .downcast_mut::<Cube>()
             .unwrap()
     }
 
@@ -162,7 +314,14 @@ impl ShapeManager {
     }
 
     pub fn sphere_buffer_size(&self, device: &Device) -> u32 {
-        let raw_size = std::mem::size_of::<SphereData>() * self.sphere_index as usize; // sphere index is sphere count
+        let raw_size = std::mem::size_of::<SphereData>() * self.map[0].len() as usize; // sphere index is sphere count
+        let chunk_size = device.limits().min_storage_buffer_offset_alignment;
+        let chunks = (raw_size as f32 / chunk_size as f32).ceil() as u32;
+        chunks * chunk_size
+    }
+
+    pub fn cube_buffer_size(&self, device: &Device) -> u32 {
+        let raw_size = std::mem::size_of::<CubeData>() * self.map[1].len() as usize; // cube index is cube count
         let chunk_size = device.limits().min_storage_buffer_offset_alignment;
         let chunks = (raw_size as f32 / chunk_size as f32).ceil() as u32;
         chunks * chunk_size
@@ -170,7 +329,8 @@ impl ShapeManager {
 
     pub fn update_shader_config(&self, config: &mut ShaderParams) {
         config.shape_count = self.shapes.len() as u32;
-        config.sphere_count = self.sphere_index;
+        config.sphere_count = self.map[0].len() as u32;
+        config.cube_count = self.map[1].len() as u32;
     }
 
     pub fn shape_count(&self) -> u32 {
@@ -178,6 +338,24 @@ impl ShapeManager {
     }
 
     pub fn sphere_count(&self) -> u32 {
-        self.sphere_index
+        self.indices[0]
+    }
+
+    pub fn get_sphere_mut(&mut self, index: u32) -> Option<&mut Sphere> {
+        // A very elegant solution to my tangled mess of a data structure
+        self.map[0]
+            .get_mut(index as usize)
+            .and_then(|a| self.shapes.get_mut(*a as usize))
+            .map(|a| a.as_any_mut().downcast_mut::<Sphere>())
+            .flatten()
+    }
+
+    pub fn get_cube_mut(&mut self, index: u32) -> Option<&mut Cube> {
+        self.map[1]
+            .get_mut(index as usize)
+            .and_then(|a| self.shapes.get_mut(*a as usize))
+            .map(|a| a.as_any_mut().downcast_mut::<Cube>())
+            .flatten()
     }
 }
+//#endregion

@@ -162,7 +162,7 @@ impl CameraController {
 
     pub fn process_mouse(&mut self, mouse_dx: f64, mouse_dy: f64) {
         self.rotate_horizontal = -mouse_dx as f32;
-        self.rotate_vertical = -mouse_dy as f32;
+        self.rotate_vertical = mouse_dy as f32;
     }
 
     pub fn process_scroll(&mut self, delta: &MouseScrollDelta) {
@@ -195,7 +195,7 @@ impl CameraController {
 
         // Move up/down. Since we don't use roll, we can just
         // modify the y coordinate directly.
-        camera.position.y += (self.amount_up - self.amount_down) * self.speed * dt;
+        camera.position.y -= (self.amount_up - self.amount_down) * self.speed * dt;
 
         // Rotate
         camera.yaw += Rad(self.rotate_horizontal) * self.sensitivity * dt;

@@ -4,13 +4,13 @@
 pub mod util {
     pub mod camera;
     pub mod constructors;
+    pub mod image;
     pub mod shapes;
     pub mod vertex;
 }
 
-use cgmath::Deg;
+use cgmath::{Deg, Quaternion, Rotation3};
 use std::default::Default;
-use std::num::NonZeroU32;
 use wgpu::{BufferBindingType, DynamicOffset};
 use winit::{
     event::*,
@@ -23,7 +23,8 @@ use winit::window::CursorGrabMode;
 
 use crate::util::camera::*;
 use crate::util::constructors::*;
-use crate::util::shapes::ShapeManager;
+use crate::util::image::Video;
+use crate::util::shapes::{Cube, Shape, ShapeManager};
 use crate::util::vertex;
 use crate::util::vertex::VERTICES;
 
@@ -45,6 +46,7 @@ struct State {
     shape_bind_group: wgpu::BindGroup,
     shape_buffer: wgpu::Buffer,
     sphere_buffer: wgpu::Buffer,
+    cube_buffer: wgpu::Buffer,
 
     // Camera Config
     camera: Camera,
@@ -59,6 +61,12 @@ struct State {
     shader_params: ShaderParams,
     config_buffer: wgpu::Buffer,
     config_bind_group: wgpu::BindGroup,
+
+    // Apple
+    bad_apple: bool,
+    bad_apple_timer: f32,
+    bad_apple_size: (u32, u32),
+    bad_apple_video: Video,
 }
 
 #[repr(C)]
@@ -71,6 +79,27 @@ pub struct ShaderParams {
     // Array sizes
     shape_count: u32,
     sphere_count: u32,
+    cube_count: u32,
+}
+
+impl ShaderParams {
+    pub fn sin_t(&self) -> f32 {
+        self.time.sin()
+    }
+
+    pub fn cos_t(&self) -> f32 {
+        self.time.cos()
+    }
+
+    // scaled sin
+    pub fn ssin_t(&self, scale: f32) -> f32 {
+        (self.time * scale).sin()
+    }
+
+    // scaled cos
+    pub fn scos_t(&self, scale: f32) -> f32 {
+        (self.time * scale).cos()
+    }
 }
 
 impl State {
@@ -139,6 +168,7 @@ impl State {
             height: size.height,
             shape_count: 0,
             sphere_count: 0,
+            cube_count: 0,
         };
 
         let config_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -167,11 +197,17 @@ impl State {
 
         //#region shape buffers
         let mut shape_manager = ShapeManager::new();
-        for x in 0..17 {
-            for y in 0..23 {
-                shape_manager.new_sphere(
-                    ((x * 3) as f32, (y * 3) as f32, 0.0).into(),
-                    1.0,
+        let apple_size = (20, 15);
+        for x in 0..apple_size.0 {
+            for y in 0..apple_size.1 {
+                // shape_manager.new_sphere(
+                //     ((x * 3) as f32, (y * 3) as f32, 0.0).into(),
+                //     1.0,
+                //     (0.2 + (x as f32 * 0.04), 0.2 + (y as f32 * 0.04), 0.2).into(),
+                // );
+                shape_manager.new_cube(
+                    ((x * 2)  as f32, (y * 2) as f32, 0.0).into(),
+                    (1.0, 1.0, 1.0).into(),
                     (0.2 + (x as f32 * 0.04), 0.2 + (y as f32 * 0.04), 0.2).into(),
                 );
             }
@@ -186,6 +222,12 @@ impl State {
         let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sphere Buffer"),
             contents: &*shape_manager.serialize_spheres(),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let cube_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Cube Buffer"),
+            contents: &*shape_manager.serialize_cubes(),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -212,6 +254,16 @@ impl State {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: true,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
                 label: Some("shape_bind_group_layout"),
             });
@@ -226,6 +278,10 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: sphere_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: cube_buffer.as_entire_binding(),
                 },
             ],
             label: Some("shape_bind_group"),
@@ -306,6 +362,7 @@ impl State {
             shape_bind_group,
             shape_buffer,
             sphere_buffer,
+            cube_buffer,
 
             // Camera config
             camera,
@@ -320,6 +377,12 @@ impl State {
             shader_params,
             config_buffer,
             config_bind_group,
+
+            // Apple
+            bad_apple: false,
+            bad_apple_timer: 0.0,
+            bad_apple_size: apple_size,
+            bad_apple_video: Video::new("./assets/apple", apple_size.0, apple_size.1),
         }
     }
 
@@ -345,7 +408,19 @@ impl State {
                         ..
                     },
                 ..
-            } => self.camera_controller.process_keyboard(*key, *state),
+            } => if self.camera_controller.process_keyboard(*key, *state) {
+                true
+            } else {
+                match (key, state) {
+                    (VirtualKeyCode::Q, ElementState::Pressed) => {
+                        // Start / Stop bad apple
+                        self.bad_apple = !self.bad_apple;
+                        self.bad_apple_timer = 0.0;
+                    }
+                    _ => {}
+                }
+                false
+            },
             WindowEvent::MouseWheel { delta, .. } => {
                 self.camera_controller.process_scroll(delta);
                 true
@@ -367,6 +442,31 @@ impl State {
         self.camera_uniform
             .update_view_proj(&self.camera, &self.projection);
         self.shader_params.time += dt.as_secs_f32();
+
+        if self.bad_apple {
+            self.bad_apple_timer += dt.as_secs_f32();
+
+            let frame = self.bad_apple_video.frame_index_from_time(self.bad_apple_timer, 30.0);
+            for x in 0..self.bad_apple_size.0 {
+                for y in 0..self.bad_apple_size.1 {
+                    let p = self.bad_apple_video.get_pixel_value(frame, x, y);
+                    self.shape_manager.get_cube_mut(x * self.bad_apple_size.1 + y).unwrap().set_bounds(
+                        (p, p, p).into(),
+                    );
+                }
+            }
+
+        } else {
+            self.bad_apple_timer = 0.0;
+            self.shape_manager.iter_shapes_mut()
+                .filter_map(|s| s.as_any_mut().downcast_mut::<Cube>())
+                .for_each(|c| {
+                    c.set_rotation(Quaternion::from_angle_x(Deg(0.0)));
+                    c.set_bounds((1.0, 1.0, 1.0).into());
+                });
+        }
+
+
         self.shape_manager
             .update_shader_config(&mut self.shader_params);
         self.queue.write_buffer(
@@ -388,6 +488,11 @@ impl State {
             &self.sphere_buffer,
             0,
             &*self.shape_manager.serialize_spheres(),
+        );
+        self.queue.write_buffer(
+            &self.cube_buffer,
+            0,
+            &*self.shape_manager.serialize_cubes(),
         );
     }
 
@@ -430,7 +535,7 @@ impl State {
             render_pass.set_bind_group(
                 2,
                 &self.shape_bind_group,
-                &[DynamicOffset::default(), DynamicOffset::default()],
+                &[DynamicOffset::default(), DynamicOffset::default(), DynamicOffset::default()],
             );
 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
@@ -449,11 +554,12 @@ pub async fn run() {
 
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
-    window
-        .set_cursor_grab(CursorGrabMode::Locked)
-        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
-        .or_else(|_| window.set_cursor_grab(CursorGrabMode::None))
-        .unwrap();
+
+    // window
+    //     .set_cursor_grab(CursorGrabMode::Locked)
+    //     .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+    //     .or_else(|_| window.set_cursor_grab(CursorGrabMode::None))
+    //     .unwrap();
 
     let mut state = State::new(&window).await;
     let mut last_render_time = instant::Instant::now();

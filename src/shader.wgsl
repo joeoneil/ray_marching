@@ -25,6 +25,7 @@ struct Config {
 
     shape_count: u32,
     sphere_count: u32,
+    prism_count: u32,
 }
 
 struct Shape {
@@ -36,6 +37,13 @@ struct Shape {
 // type 0
 struct Sphere {
     model: vec4<f32>, // vec3 pos, f32 radius
+}
+
+// type 1
+struct RectPrism {
+    model: vec3<f32>, // vec3 pos
+    size: vec3<f32>, // vec3 size
+    rot: vec4<f32>, // quaternion rotation
 }
 //#endregion
 
@@ -52,6 +60,8 @@ var<storage, read> shapes: array<Shape>;
 @group(2) @binding(1)
 var<storage, read> spheres: array<Sphere>;
 
+@group(2) @binding(2)
+var<storage, read> prisms: array<RectPrism>;
 
 //#endregion
 
@@ -84,9 +94,20 @@ fn sphere_sdf(sample_point: vec3<f32>, sphere: Sphere) -> f32 {
     return length(sample_point - center) - radius;
 }
 
-fn cube_sdf(sample_point: vec3<f32>, center: vec3<f32>, size: f32) -> f32 {
+// says cube but is actually a rect prism
+fn cube_sdf(sample_point: vec3<f32>, center: vec3<f32>, bounds: vec3<f32>, rot: vec4<f32>) -> f32 {
+    if (max(bounds.x, max(bounds.y, bounds.z)) < EPSILON) {
+        return 100.0; // arbitrary large number
+    }
     let p = sample_point - center;
-    return 0.0; // todo!();
+    // rotate point about center by quaternion rot
+    let q = rot.xyz;
+    let r = rot.w;
+    let t = 2.0 * cross(q, p);
+    let p = p + r * t + cross(q, t);
+    // get distance from point to rectangular prism (NOT A CUBE)
+    let d = abs(p) - bounds;
+    return length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0);
 }
 
 fn scene_sdf(sample_point: vec3<f32>) -> vec4<f32> {
@@ -95,8 +116,18 @@ fn scene_sdf(sample_point: vec3<f32>) -> vec4<f32> {
     for (var i: i32 = 0; i < i32(config.shape_count); i++) {
         var dist: f32 = 100.0;
 
+        // type 0 = sphere
         if (shapes[i].shape_type == u32(0)) {
             dist = sphere_sdf(sample_point, spheres[shapes[i].index]);
+        }
+
+        // type 1 = rect prism
+        else if (shapes[i].shape_type == u32(1)) {
+            dist = cube_sdf(sample_point, prisms[shapes[i].index].model.xyz, prisms[shapes[i].index].size.xyz, prisms[shapes[i].index].rot);
+        }
+
+        else {
+            continue;
         }
 
         if (dist < min_dist) {
@@ -173,15 +204,15 @@ fn phong_illumination(
 ) -> vec3<f32> {
     var color: vec3<f32> = ambient_light * k_a;
 
-    let l1_pos = vec3<f32>(4.0 * sin(config.time), 2.0, 4.0 * cos(config.time));
-    let l1_intensity = vec3<f32>(0.4, 0.4, 0.4);
+    let l1_pos = vec3<f32>(20.0, 20.0, 15.0);
+    let l1_intensity = vec3<f32>(0.6, 0.6, 0.6);
 
     color += phong_contrib(k_d, k_s, alpha, p, eye, l1_pos, l1_intensity);
 
-    let l2_pos = vec3<f32>(2.0 * sin(0.37 * config.time), 2.0 * cos(0.37 * config.time), 2.0);
-    let l2_intensity = vec3<f32>(0.4, 0.4, 0.4);
-
-    color += phong_contrib(k_d, k_s, alpha, p, eye, l2_pos, l2_intensity);
+//    let l2_pos = vec3<f32>(2.0 * sin(0.37 * config.time), 2.0 * cos(0.37 * config.time), 2.0);
+//    let l2_intensity = vec3<f32>(0.4, 0.4, 0.4);
+//
+//    color += phong_contrib(k_d, k_s, alpha, p, eye, l2_pos, l2_intensity);
 
     return color;
 }
@@ -204,8 +235,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let MIN_DIST = 0.0;
     let MAX_DIST = 100.0;
 
-    let screen_size = vec2<f32>(f32(config.width), f32(config.height)); // Pass in though buffer? somewhere?
-    let pixel_coord = map_screen_space(screen_size, in.position.xy);
+    let screen_size = vec2<f32>(f32(config.width), f32(config.height));
+//    let pixel_coord = map_screen_space(screen_size, in.position.xy);
+
+    let pixel_coord = vec2<f32>(in.clip_position.x, in.clip_position.y);
     if ((i32(pixel_coord.x) == i32(screen_size.x / 2.0) || i32(pixel_coord.y) == i32(screen_size.y / 2.0)) && (abs(pixel_coord.x - screen_size.x / 2.0) < 10.0 && abs(pixel_coord.y - screen_size.y / 2.0) < 10.0)) {
         return vec4<f32>(0.5, 0.5, 0.5, 1.0);
     }
@@ -222,7 +255,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let k_a = vec3<f32>(0.5, 0.5, 0.5) * dist.xyz;
     let k_d = dist.xyz;
     let k_s = vec3<f32>(1.0, 1.0, 1.0);
-    let shininess = 10.0;
+    let shininess = 1000.0;
 
     let color = phong_illumination(k_a, k_d, k_s, shininess, eye + dist.w * dir, eye);
     return rgb_to_srgb(vec4<f32>(color, 1.0));
