@@ -1,4 +1,4 @@
-use cgmath::{perspective, InnerSpace, Matrix4, Point3, Rad, Vector3};
+use cgmath::{perspective, InnerSpace, Matrix4, Point3, Rad, SquareMatrix, Vector3, Matrix};
 use std::time::Duration;
 use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseScrollDelta, VirtualKeyCode};
@@ -43,6 +43,17 @@ impl Camera {
             Vector3::unit_y(),
         )
     }
+
+    pub fn calc_inv_matrix(&self) -> Matrix4<f32> {
+        let (sin_pitch, cos_pitch) = self.pitch.0.sin_cos();
+        let (sin_yaw, cos_yaw) = self.yaw.0.sin_cos();
+
+        Matrix4::look_to_rh(
+            self.position,
+            Vector3::new(cos_pitch * cos_yaw, sin_pitch, cos_pitch * sin_yaw).normalize(),
+            Vector3::unit_y(),
+        ).invert().unwrap()
+    }
 }
 
 #[repr(C)]
@@ -54,7 +65,6 @@ pub struct CameraUniform {
 
 impl CameraUniform {
     pub fn new() -> Self {
-        use cgmath::SquareMatrix;
         Self {
             view_position: [0.0; 4],
             view_proj: Matrix4::identity().into(),
@@ -89,6 +99,10 @@ impl Projection {
     }
 
     pub fn calc_matrix(&self) -> Matrix4<f32> {
+        perspective(self.fovy, self.aspect, self.znear, self.zfar)
+    }
+
+    pub fn calc_matrix_wgpu(&self) -> Matrix4<f32> {
         OPENGL_TO_WGPU_MATRIX * perspective(self.fovy, self.aspect, self.znear, self.zfar)
     }
 }

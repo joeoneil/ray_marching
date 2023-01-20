@@ -9,7 +9,7 @@ pub mod util {
     pub mod vertex;
 }
 
-use cgmath::{Deg, Quaternion, Rotation3};
+use cgmath::{Deg, Quaternion, Rotation3, SquareMatrix};
 use std::default::Default;
 use wgpu::{BufferBindingType, DynamicOffset};
 use winit::{
@@ -19,7 +19,6 @@ use winit::{
 };
 
 use wgpu::util::DeviceExt;
-use winit::window::CursorGrabMode;
 
 use crate::util::camera::*;
 use crate::util::constructors::*;
@@ -130,8 +129,13 @@ impl State {
         //#endregion
 
         //#region Camera Config
-        let camera = Camera::new((0.0, 0.0, 10.0), Deg::<f32>(0.0), Deg::<f32>(0.0));
-        let projection = Projection::new(config.width, config.height, Deg(45.0), 0.1, 100.0);
+        let camera = Camera::new((-10.0, 0.0, 0.0), Deg::<f32>(0.0), Deg::<f32>(0.0));
+        let projection = Projection::new(
+            config.width,
+            config.height,
+            Deg(45.0),
+            0.1,
+            100.0);
         let camera_controller = CameraController::new(4.0, 0.25);
 
         let mut camera_uniform = CameraUniform::new();
@@ -206,16 +210,26 @@ impl State {
                 //     (0.2 + (x as f32 * 0.04), 0.2 + (y as f32 * 0.04), 0.2).into(),
                 // );
                 shape_manager.new_cube(
-                    ((x * 2)  as f32, (y * 2) as f32, 0.0).into(),
+                    ((x * 2) as f32, (y * 2) as f32, 0.0).into(),
                     (1.0, 1.0, 1.0).into(),
                     (0.2 + (x as f32 * 0.04), 0.2 + (y as f32 * 0.04), 0.2).into(),
                 );
             }
         }
 
+        // shape_manager.new_cube(
+        //     (0.0, 0.0, 0.0).into(),
+        //     (1.0, 1.0, 1.0).into(),
+        //     (1.0, 1.0, 1.0).into(),
+        // );
+
         let shape_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Shape Buffer"),
-            contents: &*shape_manager.serialize_shapes(),
+            contents: &*shape_manager.serialize_shapes(
+                camera.calc_inv_matrix(),
+                    projection.calc_matrix(),
+                (size.width as usize, size.height as usize),
+            ),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
@@ -408,19 +422,21 @@ impl State {
                         ..
                     },
                 ..
-            } => if self.camera_controller.process_keyboard(*key, *state) {
-                true
-            } else {
-                match (key, state) {
-                    (VirtualKeyCode::Q, ElementState::Pressed) => {
-                        // Start / Stop bad apple
-                        self.bad_apple = !self.bad_apple;
-                        self.bad_apple_timer = 0.0;
+            } => {
+                if self.camera_controller.process_keyboard(*key, *state) {
+                    true
+                } else {
+                    match (key, state) {
+                        (VirtualKeyCode::Q, ElementState::Pressed) => {
+                            // Start / Stop bad apple
+                            self.bad_apple = !self.bad_apple;
+                            self.bad_apple_timer = 0.0;
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    false
                 }
-                false
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.camera_controller.process_scroll(delta);
                 true
@@ -443,29 +459,37 @@ impl State {
             .update_view_proj(&self.camera, &self.projection);
         self.shader_params.time += dt.as_secs_f32();
 
+        // self.shape_manager
+        //     .get_cube_mut(0)
+        //     .unwrap()
+        //     // .set_bounds((0.1, 4.094, 5.465).into());
+        //     .set_bounds((1.0, 1.0, 1.0).into());
+
         if self.bad_apple {
             self.bad_apple_timer += dt.as_secs_f32();
 
-            let frame = self.bad_apple_video.frame_index_from_time(self.bad_apple_timer, 30.0);
+            let frame = self
+                .bad_apple_video
+                .frame_index_from_time(self.bad_apple_timer, 30.0);
             for x in 0..self.bad_apple_size.0 {
                 for y in 0..self.bad_apple_size.1 {
                     let p = self.bad_apple_video.get_pixel_value(frame, x, y);
-                    self.shape_manager.get_cube_mut(x * self.bad_apple_size.1 + y).unwrap().set_bounds(
-                        (p, p, p).into(),
-                    );
+                    self.shape_manager
+                        .get_cube_mut(x * self.bad_apple_size.1 + y)
+                        .unwrap()
+                        .set_bounds((p, p, p).into());
                 }
             }
-
         } else {
             self.bad_apple_timer = 0.0;
-            self.shape_manager.iter_shapes_mut()
+            self.shape_manager
+                .iter_shapes_mut()
                 .filter_map(|s| s.as_any_mut().downcast_mut::<Cube>())
                 .for_each(|c| {
                     c.set_rotation(Quaternion::from_angle_x(Deg(0.0)));
                     c.set_bounds((1.0, 1.0, 1.0).into());
                 });
         }
-
 
         self.shape_manager
             .update_shader_config(&mut self.shader_params);
@@ -482,18 +506,19 @@ impl State {
         self.queue.write_buffer(
             &self.shape_buffer,
             0,
-            &*self.shape_manager.serialize_shapes(),
+            &*self.shape_manager.serialize_shapes(
+                self.camera.calc_matrix(),
+                self.projection.calc_matrix(),
+                (self.size.width as usize, self.size.height as usize),
+            ),
         );
         self.queue.write_buffer(
             &self.sphere_buffer,
             0,
             &*self.shape_manager.serialize_spheres(),
         );
-        self.queue.write_buffer(
-            &self.cube_buffer,
-            0,
-            &*self.shape_manager.serialize_cubes(),
-        );
+        self.queue
+            .write_buffer(&self.cube_buffer, 0, &*self.shape_manager.serialize_cubes());
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -535,7 +560,11 @@ impl State {
             render_pass.set_bind_group(
                 2,
                 &self.shape_bind_group,
-                &[DynamicOffset::default(), DynamicOffset::default(), DynamicOffset::default()],
+                &[
+                    DynamicOffset::default(),
+                    DynamicOffset::default(),
+                    DynamicOffset::default(),
+                ],
             );
 
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));

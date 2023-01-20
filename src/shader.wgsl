@@ -32,6 +32,7 @@ struct Shape {
     color: vec4<f32>,
     index: u32,
     shape_type: u32,
+    bounding_box: vec4<f32>,
 };
 
 // type 0
@@ -79,6 +80,13 @@ fn ray_direction(fov: f32, size: vec2<f32>, coord: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(xy, -z));
 }
 
+fn inv_ray_direction(fov: f32, size: vec2<f32>, world_coord: vec3<f32>) -> vec2<f32> {
+    var z: f32 = (size.y / 2.0) / tan(radians(fov) / 2.0);
+    let scale = z / world_coord.z;
+    let scaled_coord = world_coord * scale;
+    return world_coord.xy + size / 2.0;
+}
+
 fn map_screen_space(size: vec2<f32>, input: vec2<f32>) -> vec2<f32> {
     let xs = size.x / 2.0;
     let ys = size.y / 2.0;
@@ -110,11 +118,17 @@ fn cube_sdf(sample_point: vec3<f32>, center: vec3<f32>, bounds: vec3<f32>, rot: 
     return length(max(d, vec3<f32>(0.0))) + min(max(d.x, max(d.y, d.z)), 0.0);
 }
 
-fn scene_sdf(sample_point: vec3<f32>) -> vec4<f32> {
+fn scene_sdf(sample_point: vec3<f32>, pixel_coord: vec2<f32>) -> vec4<f32> {
     var min_dist: f32 = 100.0; // arbitrary large number
     var color: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0); // object color
     for (var i: i32 = 0; i < i32(config.shape_count); i++) {
         var dist: f32 = 100.0;
+
+        let min = shapes[i].bounding_box.xy;
+        let max = shapes[i].bounding_box.zw;
+        if (pixel_coord.x < min.x || pixel_coord.x > max.x || pixel_coord.y < min.y || pixel_coord.y > max.y) {
+            continue;
+        }
 
         // type 0 = sphere
         if (shapes[i].shape_type == u32(0)) {
@@ -138,10 +152,10 @@ fn scene_sdf(sample_point: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(color, min_dist);
 }
 
-fn shortest_distance_to_surface(eye: vec3<f32>, dir: vec3<f32>, start: f32, MAX_DIST: f32) -> vec4<f32> {
+fn shortest_distance_to_surface(eye: vec3<f32>, dir: vec3<f32>, start: f32, MAX_DIST: f32, pixel_coord: vec2<f32>) -> vec4<f32> {
     var depth: f32 = start;
-    for (var i: i32 = 0; i < 255; i++) {
-        let dist = scene_sdf(eye + depth * dir);
+    for (var i: i32 = 0; i < 50; i++) {
+        let dist = scene_sdf(eye + depth * dir, pixel_coord);
         if (dist.w < EPSILON) {
             return vec4<f32>(dist.xyz, depth);
         }
@@ -153,11 +167,11 @@ fn shortest_distance_to_surface(eye: vec3<f32>, dir: vec3<f32>, start: f32, MAX_
     return vec4<f32>(0.1, 0.2, 0.3, MAX_DIST);
 }
 
-fn approximate_normal(p: vec3<f32>) -> vec3<f32> {
+fn approximate_normal(p: vec3<f32>, c: vec2<f32>) -> vec3<f32> {
     return normalize(vec3<f32>(
-        scene_sdf(vec3<f32>(p.x + EPSILON, p.y, p.z)).w - scene_sdf(vec3<f32>(p.x - EPSILON, p.y, p.z)).w,
-        scene_sdf(vec3<f32>(p.x, p.y + EPSILON, p.z)).w - scene_sdf(vec3<f32>(p.x, p.y - EPSILON, p.z)).w,
-        scene_sdf(vec3<f32>(p.x, p.y, p.z + EPSILON)).w - scene_sdf(vec3<f32>(p.x, p.y, p.z - EPSILON)).w,
+        scene_sdf(vec3<f32>(p.x + EPSILON, p.y, p.z), c).w - scene_sdf(vec3<f32>(p.x - EPSILON, p.y, p.z), c).w,
+        scene_sdf(vec3<f32>(p.x, p.y + EPSILON, p.z), c).w - scene_sdf(vec3<f32>(p.x, p.y - EPSILON, p.z), c).w,
+        scene_sdf(vec3<f32>(p.x, p.y, p.z + EPSILON), c).w - scene_sdf(vec3<f32>(p.x, p.y, p.z - EPSILON), c).w,
     ));
 }
 
@@ -171,9 +185,10 @@ fn phong_contrib(
     p: vec3<f32>, // Position of point being lit
     eye: vec3<f32>, // Position of the camera
     light_pos: vec3<f32>, // Position of the light
-    intensity: vec3<f32> // color / intensity of the light
+    intensity: vec3<f32>, // color / intensity of the light
+    pixel_coord: vec2<f32>
     ) -> vec3<f32> {
-    let N = approximate_normal(p);
+    let N = approximate_normal(p, pixel_coord);
     let L = normalize(light_pos - p);
     let V = normalize(eye - p);
     let R = normalize(reflect(-L, N));
@@ -201,13 +216,14 @@ fn phong_illumination(
     alpha: f32, // Shininess Coefficient
     p: vec3<f32>, // Position of point being lit
     eye: vec3<f32>, // Position of the camera
+    pixel_coord: vec2<f32>, // pixel coordinate
 ) -> vec3<f32> {
     var color: vec3<f32> = ambient_light * k_a;
 
     let l1_pos = vec3<f32>(20.0, 20.0, 15.0);
     let l1_intensity = vec3<f32>(0.6, 0.6, 0.6);
 
-    color += phong_contrib(k_d, k_s, alpha, p, eye, l1_pos, l1_intensity);
+    color += phong_contrib(k_d, k_s, alpha, p, eye, l1_pos, l1_intensity, pixel_coord);
 
 //    let l2_pos = vec3<f32>(2.0 * sin(0.37 * config.time), 2.0 * cos(0.37 * config.time), 2.0);
 //    let l2_intensity = vec3<f32>(0.4, 0.4, 0.4);
@@ -247,8 +263,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var dir: vec3<f32> = ray_direction(45.0, screen_size, pixel_coord);
     dir = dir * mat3x3<f32>(camera.view_angle[0].xyz, camera.view_angle[1].xyz, camera.view_angle[2].xyz); // get 3x3 submatrix
 
-    let dist = shortest_distance_to_surface(eye, dir, 0.0, 100.0);
+    let dist = shortest_distance_to_surface(eye, dir, 0.0, 100.0, pixel_coord);
     if (dist.w >= MAX_DIST - EPSILON) {
+
         // didn't hit anything
         return vec4<f32>(dist.xyz, 1.0);
     }
@@ -257,8 +274,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let k_s = vec3<f32>(1.0, 1.0, 1.0);
     let shininess = 1000.0;
 
-    let color = phong_illumination(k_a, k_d, k_s, shininess, eye + dist.w * dir, eye);
+    let color = phong_illumination(k_a, k_d, k_s, shininess, eye + dist.w * dir, eye, pixel_coord);
     return rgb_to_srgb(vec4<f32>(color, 1.0));
+    // return rgb_to_srgb(vec4<f32>(shapes[0].bounding_box.xy, 0.0, 1.0));
 }
 
 //#endregion
